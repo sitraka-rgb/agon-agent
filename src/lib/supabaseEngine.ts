@@ -244,36 +244,69 @@ export class SupabaseEngine implements Engine {
     return this.realtimeChannel;
   }
 
+  private realtimeListenerCount = 0;
+  private subscribed = false;
+  private subscribeScheduled = false;
+
+  private scheduleSubscribe(channel: RealtimeChannel): void {
+    if (this.subscribed || this.subscribeScheduled) return;
+
+    // Wait until all synchronous .on() registrations are complete.
+    // Supabase does not allow adding postgres_changes handlers after subscribe().
+    this.subscribeScheduled = true;
+    queueMicrotask(() => {
+      this.subscribeScheduled = false;
+      if (this.realtimeChannel !== channel || this.subscribed || this.realtimeListenerCount === 0) return;
+
+      this.subscribed = true;
+      channel.subscribe((status) => {
+        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+          console.warn('[Le Salon] Realtime : erreur de canal (vérifiez la publication supabase_realtime).', status);
+        }
+      });
+    });
+  }
+
+  private registerRealtimeListener(channel: RealtimeChannel): () => void {
+    this.realtimeListenerCount += 1;
+    this.scheduleSubscribe(channel);
+
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.realtimeListenerCount = Math.max(0, this.realtimeListenerCount - 1);
+
+      // Keep the shared channel alive until every registered callback is removed.
+      if (this.realtimeListenerCount === 0 && this.realtimeChannel === channel) {
+        void channel.unsubscribe();
+        this.realtimeChannel = null;
+        this.subscribed = false;
+        this.subscribeScheduled = false;
+      }
+    };
+  }
+
   onMessageInsert(cb: (m: Message) => void): () => void {
     const channel = this.ensureChannel();
     const handler = (payload: any) => cb(fromMessage(payload.new));
     channel.on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, handler);
-    this.subscribeIfNeeded();
-    return () => { channel.unsubscribe(); this.realtimeChannel = null; };
+    return this.registerRealtimeListener(channel);
   }
 
   onMessageUpdate(cb: (m: Message) => void): () => void {
     const channel = this.ensureChannel();
     const handler = (payload: any) => cb(fromMessage(payload.new));
     channel.on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'messages' }, handler);
-    this.subscribeIfNeeded();
-    return () => { channel.unsubscribe(); this.realtimeChannel = null; };
+    return this.registerRealtimeListener(channel);
   }
 
   onProfileUpdate(cb: (p: Profile) => void): () => void {
     const channel = this.ensureChannel();
-    const handler = (payload: any) => { if (payload.new && payload.new.id) cb(fromProfile(payload.new)); };
+    const handler = (payload: any) => {
+      if (payload.new && payload.new.id) cb(fromProfile(payload.new));
+    };
     channel.on('postgres_changes', { event: '*', schema: 'public', table: 'profiles' }, handler);
-    this.subscribeIfNeeded();
-    return () => { channel.unsubscribe(); this.realtimeChannel = null; };
-  }
-
-  private subscribed = false;
-  private subscribeIfNeeded() {
-    if (this.subscribed) return;
-    this.subscribed = true;
-    this.realtimeChannel?.subscribe((status) => {
-      if (status === 'CHANNEL_ERROR') console.warn('[Le Salon] Realtime : erreur de canal (vérifiez la publication supabase_realtime).');
-    });
+    return this.registerRealtimeListener(channel);
   }
 }
