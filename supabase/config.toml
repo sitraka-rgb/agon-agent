@@ -1,0 +1,4 @@
+project_id = "le-salon-prive"
+
+[functions.admin-api]
+verify_jwt = true
